@@ -1,0 +1,98 @@
+name: Build, Sign, and Deploy
+
+on:
+  push:
+    branches: [main, release/*]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-southeast-1
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "digest=$(docker inspect $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG --format='{{.Id}}')" >> $GITHUB_OUTPUT
+
+      - name: Wait for ECR signing to complete
+        run: |
+          echo "ECR managed signing is enabled. Waiting for signature to be generated..."
+          DIGEST=${{ steps.build-image.outputs.digest }}
+          for i in {1..10}; do
+            echo "Checking signing status (attempt $i)..."
+            aws ecr describe-images \
+              --repository-name $ECR_REPOSITORY \
+              --image-ids imageDigest=$DIGEST \
+              --query 'imageDetails[0].imageTag' \
+              --output text && break
+            sleep 15
+          done
+
+      - name: Verify image signature
+        id: verify
+        run: |
+          DIGEST=${{ steps.build-image.outputs.digest }}
+          echo "Verifying image signature..."
+          
+          RESPONSE=$(aws lambda invoke \
+            --function-name "verify-signature-${{ vars.ENVIRONMENT }}" \
+            --payload "{\"repository\": \"${ECR_REPOSITORY}\", \"imageDigest\": \"${DIGEST}\"}" \
+            /tmp/verify-response.json)
+          
+          STATUS_CODE=$(jq -r '.statusCode' /tmp/verify-response.json 2>/dev/null || echo "0")
+          
+          if [ "$STATUS_CODE" != "200" ]; then
+            echo "::error::Image signature verification failed"
+            cat /tmp/verify-response.json
+            exit 1
+          fi
+          
+          echo "Signature verification passed"
+
+      - name: Deploy to ECS Fargate
+        if: success()
+        run: |
+          echo "Updating ECS service with signed image..."
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --force-new-deployment \
+            --region $AWS_REGION
+
+      - name: Notify deployment result
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "Deployment completed successfully with verified signature"
+          else
+            echo "Deployment failed - signature verification or deployment error"
+          fi
